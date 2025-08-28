@@ -468,8 +468,7 @@ class BlinkitHOTAutomation:
                     
                     media = MediaIoBaseUpload(
                         io.BytesIO(file_data),
-                        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                        resumable=True
+                        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
                     )
                     
                     self.drive_service.files().create(
@@ -478,197 +477,101 @@ class BlinkitHOTAutomation:
                         fields='id'
                     ).execute()
                     
-                    st.info(f"Uploaded: {final_filename}")
-                    processed_count = 1
-                else:
-                    st.info(f"File already exists, skipping: {final_filename}")
-                
+                    processed_count += 1
+                    
             except Exception as e:
                 st.error(f"Failed to process attachment {filename}: {str(e)}")
         
         return processed_count
     
     def _get_excel_files_with_grn(self, folder_id: str) -> List[Dict]:
-        """Get Excel files with 'GRN' in the name from Google Drive folder"""
+        """Get Excel files containing 'GRN' in name from Drive folder"""
         try:
-            # Query for Excel files containing 'GRN' in the name
             query = f"'{folder_id}' in parents and (mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' or mimeType='application/vnd.ms-excel') and name contains 'GRN' and trashed=false"
+            results = self.drive_service.files().list(
+                q=query,
+                fields="files(id, name, mimeType)"
+            ).execute()
             
-            files = []
-            page_token = None
-            
-            while True:
-                request_params = {
-                    'q': query,
-                    'fields': "files(id, name), nextPageToken",
-                    'pageSize': 100
-                }
-                
-                if page_token:
-                    request_params['pageToken'] = page_token
-                
-                results = self.drive_service.files().list(**request_params).execute()
-                
-                batch_files = results.get('files', [])
-                files.extend(batch_files)
-                
-                page_token = results.get('nextPageToken')
-                if not page_token:
-                    break
-            
-            st.info(f"Found {len(files)} GRN Excel files")
-            return files
+            files = results.get('files', [])
+            return sorted(files, key=lambda x: x['name'])
             
         except Exception as e:
-            st.error(f"Failed to list Excel files: {str(e)}")
+            st.error(f"Failed to get Excel files: {str(e)}")
             return []
     
     def _read_excel_file(self, file_id: str, filename: str, header_row: int) -> pd.DataFrame:
-        """Read Excel file from Google Drive with multiple fallback strategies"""
+        """Read Excel file from Drive with robust parsing"""
         try:
-            # Download file
+            # Download file content
             request = self.drive_service.files().get_media(fileId=file_id)
             file_stream = io.BytesIO()
             downloader = MediaIoBaseDownload(file_stream, request)
             done = False
             while not done:
                 status, done = downloader.next_chunk()
+            
             file_stream.seek(0)
             
-            st.info(f"Reading Excel file: {filename} (Size: {len(file_stream.getvalue())} bytes)")
-            
-            # Strategy 1: Try openpyxl engine first
+            # Attempt to read with pandas
             try:
-                file_stream.seek(0)
                 if header_row == -1:
-                    df = pd.read_excel(file_stream, engine="openpyxl", header=None)
+                    df = pd.read_excel(file_stream, header=None)
                 else:
-                    df = pd.read_excel(file_stream, engine="openpyxl", header=header_row)
-                if not df.empty:
-                    df = self._clean_dataframe(df)
-                    return df
+                    df = pd.read_excel(file_stream, header=header_row)
+                return self._clean_dataframe(df)
             except Exception as e:
-                st.warning(f"openpyxl failed: {str(e)[:50]}...")
+                st.warning(f"Standard read failed: {str(e)[:50]}...")
             
-            # Strategy 2: Try xlrd for .xls files
-            if filename.lower().endswith('.xls'):
-                try:
-                    file_stream.seek(0)
-                    if header_row == -1:
-                        df = pd.read_excel(file_stream, engine="xlrd", header=None)
-                    else:
-                        df = pd.read_excel(file_stream, engine="xlrd", header=header_row)
-                    if not df.empty:
-                        df = self._clean_dataframe(df)
-                        return df
-                except Exception as e:
-                    st.warning(f"xlrd failed: {str(e)[:50]}...")
-            
-            # Strategy 3: Raw XML extraction for corrupted files
-            df = self._try_raw_xml_extraction(file_stream, header_row)
+            # Fallback: raw XML extraction for corrupted files
+            df = self._try_raw_xml_extraction(file_stream, filename, header_row)
             if not df.empty:
-                df = self._clean_dataframe(df)
-                return df
+                return self._clean_dataframe(df)
             
-            st.error(f"All strategies failed for: {filename}")
             return pd.DataFrame()
             
         except Exception as e:
-            st.error(f"Failed to read Excel file {filename}: {str(e)}")
+            st.error(f"Failed to read {filename}: {str(e)}")
             return pd.DataFrame()
     
-    def _try_raw_xml_extraction(self, file_stream, header_row):
-        """Raw XML extraction with proper text handling"""
+    def _try_raw_xml_extraction(self, file_stream: io.BytesIO, filename: str, header_row: int) -> pd.DataFrame:
+        """Extract data from Excel XML for corrupted files"""
         try:
             file_stream.seek(0)
-            with zipfile.ZipFile(file_stream, 'r') as zip_ref:
-                # Look for shared strings
-                shared_strings = {}
-                shared_strings_file = 'xl/sharedStrings.xml'
-                if shared_strings_file in zip_ref.namelist():
-                    try:
-                        with zip_ref.open(shared_strings_file) as ss_file:
-                            ss_content = ss_file.read().decode('utf-8', errors='ignore')
-                            string_pattern = r'<t[^>]*>([^<]*)</t>'
-                            strings = re.findall(string_pattern, ss_content, re.DOTALL)
-                            for i, string_val in enumerate(strings):
-                                shared_strings[str(i)] = string_val.strip()
-                    except Exception:
-                        pass
-                
-                # Look for worksheet files
-                worksheet_files = [f for f in zip_ref.namelist() if 'xl/worksheets/' in f and f.endswith('.xml')]
+            with zipfile.ZipFile(file_stream) as zip_ref:
+                # Find worksheet
+                worksheet_files = [f for f in zip_ref.namelist() if f.startswith('xl/worksheets/sheet')]
                 if not worksheet_files:
                     return pd.DataFrame()
                 
-                # Try to read the first worksheet
-                with zip_ref.open(worksheet_files[0]) as xml_file:
-                    content = xml_file.read().decode('utf-8', errors='ignore')
-                    
-                    # Extract cell references with their types and values
-                    cell_pattern = r'<c[^>]*r="([A-Z]+\d+)"[^>]*(?:t="([^"]*)")?[^>]*>(?:.*?<v[^>]*>([^<]*)</v>)?(?:.*?<is><t[^>]*>([^<]*)</t></is>)?'
-                    cells = re.findall(cell_pattern, content, re.DOTALL)
-                    
-                    if not cells:
-                        return pd.DataFrame()
-                    
-                    # Convert cell references to row/col coordinates
-                    cell_data = {}
-                    max_row = 0
-                    max_col = 0
-                    
-                    for cell_ref, cell_type, v_value, is_value in cells:
-                        # Parse cell reference (e.g., "A1" -> row 1, col 1)
-                        col_letters = ''.join([c for c in cell_ref if c.isalpha()])
-                        row_num = int(''.join([c for c in cell_ref if c.isdigit()]))
-                        
-                        col_num = 0
-                        for c in col_letters:
-                            col_num = col_num * 26 + (ord(c) - ord('A') + 1)
-                        
-                        # Determine the actual cell value based on type
-                        if is_value:  # Inline string
-                            cell_value = is_value.strip()
-                        elif cell_type == 's' and v_value:  # Shared string reference
-                            cell_value = shared_strings.get(v_value, v_value)
-                        elif cell_type == 'str' and v_value:  # String
-                            cell_value = v_value.strip()
-                        elif v_value:  # Number or other value
-                            cell_value = v_value.strip()
-                        else:
-                            cell_value = ""
-                        
-                        cell_data[(row_num, col_num)] = self._clean_cell_value(cell_value)
-                        max_row = max(max_row, row_num)
-                        max_col = max(max_col, col_num)
-                    
-                    if not cell_data:
-                        return pd.DataFrame()
-                    
-                    # Convert to 2D array
-                    data = []
-                    for row in range(1, max_row + 1):
-                        row_data = []
-                        for col in range(1, max_col + 1):
-                            row_data.append(cell_data.get((row, col), ""))
-                        if any(cell for cell in row_data):  # Only add non-empty rows
-                            data.append(row_data)
-                    
-                    if len(data) < max(1, header_row + 2):
-                        return pd.DataFrame()
-                    
-                    if header_row == -1:
-                        # No headers - create generic column names
-                        headers = [f"Column_{i+1}" for i in range(len(data[0]))]
-                        return pd.DataFrame(data, columns=headers)
-                    else:
-                        # Use specified header row
-                        if len(data) > header_row:
-                            headers = [str(h) if h else f"Column_{i+1}" for i, h in enumerate(data[header_row])]
-                            return pd.DataFrame(data[header_row+1:], columns=headers)
-                        else:
-                            return pd.DataFrame()
-                    
+                xml_content = zip_ref.read(worksheet_files[0]).decode('utf-8')
+                tree = etree.fromstring(xml_content.encode('utf-8'))
+                
+                # Extract cells
+                ns = {'ns': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+                rows = tree.xpath('//ns:row', namespaces=ns)
+                
+                data = []
+                for row in rows:
+                    row_data = []
+                    cells = row.xpath('ns:c', namespaces=ns)
+                    for cell in cells:
+                        value = cell.xpath('ns:v/text()', namespaces=ns)
+                        row_data.append(value[0] if value else '')
+                    if row_data:
+                        data.append(row_data)
+                
+                if not data:
+                    return pd.DataFrame()
+                
+                if header_row >= 0 and len(data) > header_row:
+                    headers = data[header_row]
+                    df = pd.DataFrame(data[header_row+1:], columns=headers)
+                else:
+                    df = pd.DataFrame(data)
+                
+                return df
+                
         except Exception as e:
             st.warning(f"Raw XML extraction failed: {str(e)[:50]}...")
             return pd.DataFrame()
@@ -850,269 +753,85 @@ def create_streamlit_ui():
     
     st.sidebar.success("✅ Authenticated")
     
-    # Main content based on workflow choice
-    if workflow_choice == "Gmail Attachment Downloader":
-        create_gmail_workflow_ui()
-    elif workflow_choice == "Excel GRN Processor":
-        create_excel_workflow_ui()
-    else:
-        create_combined_workflow_ui()
-
-
-def create_gmail_workflow_ui():
-    """Create Gmail workflow UI"""
-    st.header("📧 Gmail Attachment Downloader")
-    st.markdown("Download Excel attachments from Gmail and organize them in Google Drive")
-    
+    # Common inputs for days_back and max_results
     with st.expander("Configuration", expanded=True):
         col1, col2 = st.columns(2)
         
         with col1:
-            sender = st.text_input(
-                "Sender Email (optional)",
-                placeholder="sender@example.com",
-                help="Filter emails from specific sender"
-            )
-            
-            search_term = st.text_input(
-                "Search Terms",
-                placeholder="GRN, invoice, report",
-                help="Comma-separated keywords to search for"
-            )
-        
-        with col2:
             days_back = st.number_input(
                 "Days Back to Search",
                 min_value=1,
                 max_value=365,
-                value=7,
+                value=30,
                 help="How many days back to search emails"
             )
-            
+        
+        with col2:
             max_results = st.number_input(
                 "Maximum Results",
                 min_value=1,
                 max_value=500,
-                value=50,
+                value=1000,
                 help="Maximum number of emails to process"
             )
-        
-        gdrive_folder_id = st.text_input(
-            "Google Drive Folder ID (optional)",
-            placeholder="1ABC_defGHI23jklMNO456pqrSTU789vwxYZ",
-            help="Parent folder ID in Google Drive. Leave empty for root folder."
-        )
     
-    if st.button("🚀 Start Gmail Workflow", type="primary"):
-        config = {
-            'sender': sender.strip(),
-            'search_term': search_term.strip(),
-            'days_back': days_back,
-            'max_results': max_results,
-            'gdrive_folder_id': gdrive_folder_id.strip() if gdrive_folder_id.strip() else None
-        }
-        
-        with st.spinner("Processing Gmail workflow..."):
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            result = st.session_state.automation.process_gmail_workflow(config, progress_bar, status_text)
-            
-            if result['success']:
-                st.balloons()
-                st.success(f"🎉 Gmail workflow completed! Processed {result['processed']} attachments")
-            else:
-                st.error("❌ Gmail workflow failed")
-
-
-def create_excel_workflow_ui():
-    """Create Excel workflow UI"""
-    st.header("📊 Excel GRN Processor")
-    st.markdown("Process Excel files with 'GRN' in their names and consolidate data")
+    # Hardcoded configs
+    gmail_config = {
+        'sender': 'purchaseorder@handsontrades.com',
+        'search_term': 'GRN and reconciliation ',
+        'days_back': days_back,
+        'max_results': max_results,
+        'gdrive_folder_id': '1pZnVxyPRJWaoYldxvWyXLFxQHbdckZfP'
+    }
     
-    with st.expander("Configuration", expanded=True):
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            excel_folder_id = st.text_input(
-                "Excel Files Folder ID *",
-                placeholder="1ABC_defGHI23jklMNO456pqrSTU789vwxYZ",
-                help="Google Drive folder ID containing Excel files with 'GRN' in names"
-            )
-            
-            spreadsheet_id = st.text_input(
-                "Target Google Sheet ID *",
-                placeholder="1ABC_defGHI23jklMNO456pqrSTU789vwxYZ",
-                help="Google Sheets ID where data will be consolidated"
-            )
-        
-        with col2:
-            sheet_name = st.text_input(
-                "Sheet Name *",
-                value="Consolidated_GRN_Data",
-                help="Name of the sheet tab to write data to"
-            )
-            
-            header_row = st.number_input(
-                "Header Row Number",
-                min_value=-1,
-                value=0,
-                help="Row number containing headers (0-based). Use -1 for no headers."
-            )
+    excel_config = {
+        'excel_folder_id': '1-Gyaxv4WYjmOI4v2BBx9hDT37kcLweBY',
+        'spreadsheet_id': '10wyfALowemBcEFiZP9Tyy08npl_44FpHonO3rKARmRY',
+        'sheet_name': 'hotgrn',
+        'header_row': 0
+    }
     
-    if st.button("🚀 Start Excel Workflow", type="primary"):
-        if not excel_folder_id.strip() or not spreadsheet_id.strip() or not sheet_name.strip():
-            st.error("❌ Please fill in all required fields marked with *")
-            return
-        
-        config = {
-            'excel_folder_id': excel_folder_id.strip(),
-            'spreadsheet_id': spreadsheet_id.strip(),
-            'sheet_name': sheet_name.strip(),
-            'header_row': header_row
-        }
-        
-        with st.spinner("Processing Excel workflow..."):
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            result = st.session_state.automation.process_excel_workflow(config, progress_bar, status_text)
-            
-            if result['success']:
-                st.balloons()
-                st.success(f"🎉 Excel workflow completed! Processed {result['processed']} files")
-            else:
-                st.error("❌ Excel workflow failed")
-
-
-def create_combined_workflow_ui():
-    """Create combined workflow UI"""
-    st.header("🔄 Combined Workflow")
-    st.markdown("Run both Gmail attachment download and Excel GRN processing in sequence")
+    # Main content based on workflow choice
+    if workflow_choice == "Gmail Attachment Downloader":
+        if st.button("🚀 Start Gmail Workflow", type="primary"):
+            with st.spinner("Processing Gmail workflow..."):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                result = st.session_state.automation.process_gmail_workflow(gmail_config, progress_bar, status_text)
+                
+                if result['success']:
+                    st.balloons()
+                    st.success(f"🎉 Gmail workflow completed! Processed {result['processed']} attachments")
+                else:
+                    st.error("❌ Gmail workflow failed")
     
-    # Gmail Configuration
-    with st.expander("📧 Gmail Configuration", expanded=True):
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            gmail_sender = st.text_input(
-                "Sender Email (optional)",
-                placeholder="sender@example.com",
-                help="Filter emails from specific sender",
-                key="combined_gmail_sender"
-            )
-            
-            gmail_search_term = st.text_input(
-                "Search Terms",
-                placeholder="GRN, invoice, report",
-                help="Comma-separated keywords to search for",
-                key="combined_gmail_search"
-            )
-        
-        with col2:
-            gmail_days_back = st.number_input(
-                "Days Back to Search",
-                min_value=1,
-                max_value=365,
-                value=7,
-                help="How many days back to search emails",
-                key="combined_gmail_days"
-            )
-            
-            gmail_max_results = st.number_input(
-                "Maximum Results",
-                min_value=1,
-                max_value=500,
-                value=50,
-                help="Maximum number of emails to process",
-                key="combined_gmail_max"
-            )
-        
-        gmail_folder_id = st.text_input(
-            "Google Drive Folder ID (optional)",
-            placeholder="1ABC_defGHI23jklMNO456pqrSTU789vwxYZ",
-            help="Parent folder ID in Google Drive. Leave empty for root folder.",
-            key="combined_gmail_folder"
-        )
+    elif workflow_choice == "Excel GRN Processor":
+        if st.button("🚀 Start Excel Workflow", type="primary"):
+            with st.spinner("Processing Excel workflow..."):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                result = st.session_state.automation.process_excel_workflow(excel_config, progress_bar, status_text)
+                
+                if result['success']:
+                    st.balloons()
+                    st.success(f"🎉 Excel workflow completed! Processed {result['processed']} files")
+                else:
+                    st.error("❌ Excel workflow failed")
     
-    # Excel Configuration
-    with st.expander("📊 Excel Configuration", expanded=True):
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            excel_folder_id = st.text_input(
-                "Excel Files Folder ID *",
-                placeholder="1ABC_defGHI23jklMNO456pqrSTU789vwxYZ",
-                help="Google Drive folder ID containing Excel files with 'GRN' in names",
-                key="combined_excel_folder"
-            )
-            
-            spreadsheet_id = st.text_input(
-                "Target Google Sheet ID *",
-                placeholder="1ABC_defGHI23jklMNO456pqrSTU789vwxYZ",
-                help="Google Sheets ID where data will be consolidated",
-                key="combined_spreadsheet"
-            )
-        
-        with col2:
-            sheet_name = st.text_input(
-                "Sheet Name *",
-                value="Consolidated_GRN_Data",
-                help="Name of the sheet tab to write data to",
-                key="combined_sheet_name"
-            )
-            
-            header_row = st.number_input(
-                "Header Row Number",
-                min_value=-1,
-                value=0,
-                help="Row number containing headers (0-based). Use -1 for no headers.",
-                key="combined_header_row"
-            )
-    
-    # Workflow Options
-    with st.expander("⚙️ Workflow Options", expanded=False):
-        skip_gmail = st.checkbox(
-            "Skip Gmail workflow",
-            help="Skip the Gmail attachment download and only process existing Excel files"
-        )
-        
-        skip_excel = st.checkbox(
-            "Skip Excel workflow", 
-            help="Only download Gmail attachments without processing Excel files"
-        )
-    
-    if st.button("🚀 Start Combined Workflow", type="primary"):
-        if not skip_excel and (not excel_folder_id.strip() or not spreadsheet_id.strip() or not sheet_name.strip()):
-            st.error("❌ Please fill in all required Excel fields marked with * or check 'Skip Excel workflow'")
-            return
-        
-        gmail_config = {
-            'sender': gmail_sender.strip(),
-            'search_term': gmail_search_term.strip(),
-            'days_back': gmail_days_back,
-            'max_results': gmail_max_results,
-            'gdrive_folder_id': gmail_folder_id.strip() if gmail_folder_id.strip() else None
-        }
-        
-        excel_config = {
-            'excel_folder_id': excel_folder_id.strip(),
-            'spreadsheet_id': spreadsheet_id.strip(),
-            'sheet_name': sheet_name.strip(),
-            'header_row': header_row
-        }
-        
-        with st.spinner("Processing combined workflow..."):
-            overall_progress = st.progress(0)
-            status_text = st.empty()
-            
-            gmail_success = True
-            excel_success = True
-            gmail_processed = 0
-            excel_processed = 0
-            
-            # Run Gmail workflow
-            if not skip_gmail:
+    else:  # Combined Workflow
+        if st.button("🚀 Start Combined Workflow", type="primary"):
+            with st.spinner("Processing combined workflow..."):
+                overall_progress = st.progress(0)
+                status_text = st.empty()
+                
+                gmail_success = True
+                excel_success = True
+                gmail_processed = 0
+                excel_processed = 0
+                
+                # Run Gmail workflow
                 status_text.text("Starting Gmail workflow...")
                 gmail_progress = st.progress(0)
                 gmail_status = st.empty()
@@ -1129,43 +848,34 @@ def create_combined_workflow_ui():
                     st.success(f"✅ Gmail workflow completed! Processed {gmail_processed} attachments")
                 else:
                     st.error("❌ Gmail workflow failed")
-            else:
-                overall_progress.progress(50)
-                st.info("⏭️ Skipping Gmail workflow")
-            
-            # Run Excel workflow
-            if not skip_excel and (gmail_success or skip_gmail):
-                status_text.text("Starting Excel workflow...")
-                excel_progress = st.progress(0)
-                excel_status = st.empty()
                 
-                excel_result = st.session_state.automation.process_excel_workflow(
-                    excel_config, excel_progress, excel_status
-                )
-                excel_success = excel_result['success']
-                excel_processed = excel_result['processed']
+                # Run Excel workflow automatically after Gmail
+                if gmail_success:
+                    status_text.text("Starting Excel workflow...")
+                    excel_progress = st.progress(0)
+                    excel_status = st.empty()
+                    
+                    excel_result = st.session_state.automation.process_excel_workflow(
+                        excel_config, excel_progress, excel_status
+                    )
+                    excel_success = excel_result['success']
+                    excel_processed = excel_result['processed']
+                    
+                    if excel_success:
+                        st.success(f"✅ Excel workflow completed! Processed {excel_processed} files")
+                    else:
+                        st.error("❌ Excel workflow failed")
                 
-                if excel_success:
-                    st.success(f"✅ Excel workflow completed! Processed {excel_processed} files")
+                overall_progress.progress(100)
+                status_text.text("Combined workflow completed!")
+                
+                # Final summary
+                if gmail_success and excel_success:
+                    st.balloons()
+                    summary = f"🎉 Combined workflow completed successfully!\n📧 Gmail: {gmail_processed} attachments processed\n📊 Excel: {excel_processed} files processed"
+                    st.success(summary)
                 else:
-                    st.error("❌ Excel workflow failed")
-            elif skip_excel:
-                st.info("⏭️ Skipping Excel workflow")
-            
-            overall_progress.progress(100)
-            status_text.text("Combined workflow completed!")
-            
-            # Final summary
-            if (gmail_success or skip_gmail) and (excel_success or skip_excel):
-                st.balloons()
-                summary = f"🎉 Combined workflow completed successfully!"
-                if not skip_gmail:
-                    summary += f"\n📧 Gmail: {gmail_processed} attachments processed"
-                if not skip_excel:
-                    summary += f"\n📊 Excel: {excel_processed} files processed"
-                st.success(summary)
-            else:
-                st.error("❌ Combined workflow completed with errors")
+                    st.error("❌ Combined workflow completed with errors")
 
 
 # Help and Information Section
@@ -1176,18 +886,12 @@ def create_help_section():
         ### Setup Steps:
         1. **Authenticate** with Google APIs using the button above
         2. **Choose workflow** from the dropdown
-        3. **Configure settings** for your selected workflow
+        3. **Configure Days Back and Maximum Results**
         4. **Run the workflow** using the start button
         
-        ### Google Drive Folder ID:
-        - Open the folder in Google Drive
-        - Copy the ID from the URL after `/folders/`
-        - Example: `1ABC_defGHI23jklMNO456pqrSTU789vwxYZ`
-        
-        ### Google Sheet ID:
-        - Open the spreadsheet in Google Sheets
-        - Copy the ID from the URL between `/d/` and `/edit`
-        - Example: `1ABC_defGHI23jklMNO456pqrSTU789vwxYZ`
+        ### Notes:
+        - Configurations like sender, search terms, and folder IDs are pre-set.
+        - For Combined Workflow, Gmail runs first, followed automatically by Excel.
         """)
     
     with st.sidebar.expander("ℹ️ About", expanded=False):
