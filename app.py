@@ -770,7 +770,7 @@ def create_streamlit_ui():
             max_results = st.number_input(
                 "Maximum Results",
                 min_value=1,
-                max_value=500,
+                max_value=1000,
                 value=1000,
                 help="Maximum number of emails to process"
             )
